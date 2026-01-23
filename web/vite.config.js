@@ -29,6 +29,11 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
+      // 修复 semi-ui CSS 路径问题
+      '@douyinfe/semi-ui/dist/css/semi.css': path.resolve(
+        __dirname,
+        'node_modules/@douyinfe/semi-ui/dist/css/semi.css'
+      ),
     },
   },
   plugins: [

@@ -297,4 +297,23 @@ func SetApiRouter(router *gin.Engine) {
 			deploymentsRoute.DELETE("/:id", controller.DeleteDeployment)
 		}
 	}
+
+	// wukong 兼容路由 - /usage/api 下的端点
+	wukongRoute := router.Group("/usage/api")
+	wukongRoute.Use(gzip.Gzip(gzip.DefaultCompression))
+	wukongRoute.Use(middleware.GlobalAPIRateLimit())
+	wukongRoute.Use(middleware.TokenAuth())
+	{
+		wukongRoute.GET("/balance", controller.WukongGetBalance)
+		wukongRoute.GET("/get-models", controller.WukongGetModels)
+	}
+
+	// wukong chat-stream - 直接注册到根路径 /chat-stream
+	chatStreamRoute := router.Group("")
+	chatStreamRoute.Use(gzip.Gzip(gzip.DefaultCompression))
+	chatStreamRoute.Use(middleware.GlobalAPIRateLimit())
+	chatStreamRoute.Use(middleware.TokenAuth())
+	{
+		chatStreamRoute.POST("/chat-stream", controller.WukongChatStream)
+	}
 }
