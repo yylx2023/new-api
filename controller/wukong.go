@@ -382,35 +382,123 @@ func WukongChatStream(c *gin.Context) {
 }
 
 // streamAndParseUsage 流式传输响应并解析 usage 信息
+// 支持多种 SSE 格式和非标准 usage 位置
 func streamAndParseUsage(c *gin.Context, body io.Reader) dto.Usage {
 	var usage dto.Usage
-	scanner := bufio.NewScanner(body)
-	// 增大缓冲区以处理大响应
-	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	reader := bufio.NewReader(body)
 
-	for scanner.Scan() {
-		line := scanner.Text()
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				// 处理最后可能没有换行的数据
+				if len(line) > 0 {
+					c.Writer.Write([]byte(line))
+					c.Writer.Flush()
+					// 尝试解析
+					parseUsageFromLine(line, &usage)
+				}
+				break
+			}
+			common.SysError("读取响应流失败: " + err.Error())
+			break
+		}
+
 		// 写入响应
-		c.Writer.Write([]byte(line + "\n"))
+		c.Writer.Write([]byte(line))
 		c.Writer.Flush()
 
+		// 去除行尾换行符进行解析
+		trimmedLine := strings.TrimRight(line, "\r\n")
+
 		// 解析 SSE 数据
-		if strings.HasPrefix(line, "data: ") {
-			data := strings.TrimPrefix(line, "data: ")
+		if strings.HasPrefix(trimmedLine, "data: ") {
+			data := strings.TrimPrefix(trimmedLine, "data: ")
 			if data == "[DONE]" {
 				continue
 			}
+
 			// 尝试解析 usage
-			var streamResp dto.ChatCompletionsStreamResponse
-			if err := json.Unmarshal([]byte(data), &streamResp); err == nil {
-				if streamResp.Usage != nil {
-					usage = *streamResp.Usage
-				}
+			parseUsageFromData(data, &usage)
+		} else if strings.HasPrefix(trimmedLine, "data:") {
+			// 处理 "data:" 后直接跟数据的情况（无空格）
+			data := strings.TrimPrefix(trimmedLine, "data:")
+			if data != "[DONE]" && data != "" {
+				parseUsageFromData(data, &usage)
 			}
+		} else if strings.Contains(trimmedLine, `"usage"`) {
+			// 有些响应可能直接在行中包含 usage，不在 data: 前缀后
+			parseUsageFromData(trimmedLine, &usage)
 		}
 	}
+
+	// 记录解析结果用于调试
+	if usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
+		common.SysLog("警告: 未能从响应中解析到 usage 信息")
+	} else {
+		common.SysLog(fmt.Sprintf("解析到 usage: prompt=%d, completion=%d, total=%d",
+			usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens))
+	}
+
 	return usage
+}
+
+// parseUsageFromData 从 JSON 数据中解析 usage
+func parseUsageFromData(data string, usage *dto.Usage) {
+	// 尝试标准 OpenAI 流式响应格式
+	var streamResp dto.ChatCompletionsStreamResponse
+	if err := json.Unmarshal([]byte(data), &streamResp); err == nil {
+		if streamResp.Usage != nil {
+			*usage = *streamResp.Usage
+			return
+		}
+	}
+
+	// 尝试简单响应格式
+	var simpleResp dto.ChatCompletionsStreamResponseSimple
+	if err := json.Unmarshal([]byte(data), &simpleResp); err == nil {
+		if simpleResp.Usage != nil {
+			*usage = *simpleResp.Usage
+			return
+		}
+	}
+
+	// 尝试直接解析 usage 字段
+	var usageWrapper struct {
+		Usage *dto.Usage `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(data), &usageWrapper); err == nil {
+		if usageWrapper.Usage != nil {
+			*usage = *usageWrapper.Usage
+			return
+		}
+	}
+
+	// 尝试解析嵌套的 usage 对象（有些 API 返回 {"data": {"usage": {...}}} 格式）
+	var nestedResp struct {
+		Data struct {
+			Usage *dto.Usage `json:"usage"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(data), &nestedResp); err == nil {
+		if nestedResp.Data.Usage != nil {
+			*usage = *nestedResp.Data.Usage
+			return
+		}
+	}
+}
+
+// parseUsageFromLine 从整行文本中尝试提取 usage 信息
+func parseUsageFromLine(line string, usage *dto.Usage) {
+	// 查找 JSON 起始位置
+	start := strings.Index(line, "{")
+	if start == -1 {
+		return
+	}
+
+	// 尝试从 JSON 开始位置解析
+	jsonData := line[start:]
+	parseUsageFromData(jsonData, usage)
 }
 
 // returnPreConsumedQuota 返还预扣费额度
