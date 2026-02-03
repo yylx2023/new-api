@@ -182,6 +182,22 @@ func SetRelayRouter(router *gin.Engine) {
 			controller.Relay(c, types.RelayFormatGemini)
 		})
 	}
+
+	// Wukong/ChatStream 路由 - 透传到 CLIProxyAPIPlus 并计费
+	chatStreamRouter := router.Group("/chat-stream")
+	chatStreamRouter.Use(middleware.TokenAuth())
+	{
+		chatStreamRouter.POST("", controller.WukongChatStream)
+	}
+
+	// Wukong Usage API 路由
+	wukongRouter := router.Group("/usage/api")
+	wukongRouter.Use(middleware.TokenAuth())
+	{
+		wukongRouter.GET("/balance", controller.WukongGetBalance)
+		wukongRouter.GET("/get-models", controller.WukongGetModels)
+		wukongRouter.POST("/chat-stream", controller.WukongChatStream)
+	}
 }
 
 func registerMjRouterGroup(relayMjRouter *gin.RouterGroup) {
