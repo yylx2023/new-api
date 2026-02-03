@@ -92,8 +92,12 @@ func addTokenToAPIKeys(tokenKey string) error {
 	url := CLIProxyAPIManagementURL + CLIProxyAPIAPIKeysEndpoint
 
 	// 使用 PATCH 方法添加新的 api-key
+	// CLIProxyAPIPlus 的 patchStringList 接受 {"old": "xxx", "new": "yyy"} 格式
+	// 当 old 不存在于列表中且 new 有值时，会将 new 追加到列表
+	// 使用一个不可能存在的 old 值来确保追加操作
 	payload := map[string]interface{}{
-		"add": []string{tokenKey},
+		"old": "",       // 空字符串不会匹配任何已有的 key
+		"new": tokenKey, // 要添加的新 key
 	}
 
 	jsonData, err := json.Marshal(payload)
@@ -141,8 +145,9 @@ func DeleteTokenFromCLIProxy(tokenKey string) error {
 
 // removeTokenFromAPIKeys 从 CLIProxyAPIPlus 的 api-keys 列表中删除 token
 func removeTokenFromAPIKeys(tokenKey string) error {
+	// CLIProxyAPIPlus 的 deleteFromStringList 接受 ?value=xxx 参数
 	url := CLIProxyAPIManagementURL + CLIProxyAPIAPIKeysEndpoint +
-		"?key=" + strings.TrimSpace(tokenKey)
+		"?value=" + strings.TrimSpace(tokenKey)
 
 	req, err := http.NewRequest("DELETE", url, nil)
 	if err != nil {
