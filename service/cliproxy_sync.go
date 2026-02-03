@@ -72,14 +72,21 @@ type OpenAICompatibilityEntry struct {
 }
 
 // SyncTokenToCLIProxy 将 new-api 的 token 同步到 CLIProxyAPIPlus
-// 这将在 CLIProxyAPIPlus 的 api-keys 列表中添加该 token
+// 这将在 CLIProxyAPIPlus 的 openai-compatibility 配置中添加该 token 到 api-key-entries
 // 使客户端可以使用 new-api 的 token 通过 CLIProxyAPIPlus 访问服务
 func SyncTokenToCLIProxy(tokenKey string, tokenId int, userId int, tokenName string) error {
 	fullKey := "sk-" + tokenKey
 
-	// 1. 将 token 添加到 CLIProxyAPIPlus 的 api-keys 列表
-	if err := addTokenToAPIKeys(fullKey); err != nil {
-		common.SysLog(fmt.Sprintf("CLIProxy sync: failed to add token to api-keys: %v", err))
+	// 1. 获取当前的 openai-compatibility 配置
+	currentConfig, err := getOpenAICompatConfig()
+	if err != nil {
+		common.SysLog(fmt.Sprintf("CLIProxy sync: failed to get openai-compatibility config: %v", err))
+		return err
+	}
+
+	// 2. 找到 CliProxySyncConfigName 配置项并添加新的 api-key-entry
+	if err := addTokenToOpenAICompat(currentConfig, fullKey); err != nil {
+		common.SysLog(fmt.Sprintf("CLIProxy sync: failed to add token to openai-compatibility: %v", err))
 		return err
 	}
 
@@ -87,17 +94,85 @@ func SyncTokenToCLIProxy(tokenKey string, tokenId int, userId int, tokenName str
 	return nil
 }
 
-// addTokenToAPIKeys 将 token 添加到 CLIProxyAPIPlus 的 api-keys 列表
-func addTokenToAPIKeys(tokenKey string) error {
-	url := CLIProxyAPIManagementURL + CLIProxyAPIAPIKeysEndpoint
+// getOpenAICompatConfig 获取当前的 openai-compatibility 配置
+func getOpenAICompatConfig() ([]map[string]interface{}, error) {
+	url := CLIProxyAPIManagementURL + CLIProxyAPIOpenAICompatEndpoint
 
-	// 使用 PATCH 方法添加新的 api-key
-	// CLIProxyAPIPlus 的 patchStringList 接受 {"old": "xxx", "new": "yyy"} 格式
-	// 当 old 不存在于列表中且 new 有值时，会将 new 追加到列表
-	// 使用一个不可能存在的 old 值来确保追加操作
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	if managementKey := getCLIProxyManagementKey(); managementKey != "" {
+		req.Header.Set("Authorization", "Bearer "+managementKey)
+	}
+
+	resp, err := getCliProxySyncClient().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	var result struct {
+		OpenAICompatibility []map[string]interface{} `json:"openai-compatibility"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return result.OpenAICompatibility, nil
+}
+
+// addTokenToOpenAICompat 将 token 添加到 openai-compatibility 配置的 api-key-entries 中
+func addTokenToOpenAICompat(currentConfig []map[string]interface{}, tokenKey string) error {
+	// 查找目标配置项的索引
+	targetIndex := -1
+	for i, cfg := range currentConfig {
+		if name, ok := cfg["name"].(string); ok && name == CliProxySyncConfigName {
+			targetIndex = i
+			break
+		}
+	}
+
+	if targetIndex == -1 {
+		return fmt.Errorf("openai-compatibility config '%s' not found", CliProxySyncConfigName)
+	}
+
+	// 获取当前的 api-key-entries
+	var currentEntries []map[string]interface{}
+	if entries, ok := currentConfig[targetIndex]["api-key-entries"].([]interface{}); ok {
+		for _, e := range entries {
+			if entry, ok := e.(map[string]interface{}); ok {
+				currentEntries = append(currentEntries, entry)
+			}
+		}
+	}
+
+	// 检查 token 是否已存在
+	for _, entry := range currentEntries {
+		if apiKey, ok := entry["api-key"].(string); ok && apiKey == tokenKey {
+			// 已存在，无需添加
+			return nil
+		}
+	}
+
+	// 添加新的 api-key-entry
+	currentEntries = append(currentEntries, map[string]interface{}{
+		"api-key": tokenKey,
+	})
+
+	// 使用 PATCH 更新配置
+	url := CLIProxyAPIManagementURL + CLIProxyAPIOpenAICompatEndpoint
+
 	payload := map[string]interface{}{
-		"old": "",       // 空字符串不会匹配任何已有的 key
-		"new": tokenKey, // 要添加的新 key
+		"name": CliProxySyncConfigName,
+		"value": map[string]interface{}{
+			"api-key-entries": currentEntries,
+		},
 	}
 
 	jsonData, err := json.Marshal(payload)
@@ -111,7 +186,6 @@ func addTokenToAPIKeys(tokenKey string) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	// 添加管理密钥认证（如果配置了）
 	if managementKey := getCLIProxyManagementKey(); managementKey != "" {
 		req.Header.Set("Authorization", "Bearer "+managementKey)
 	}
@@ -133,9 +207,16 @@ func addTokenToAPIKeys(tokenKey string) error {
 func DeleteTokenFromCLIProxy(tokenKey string) error {
 	fullKey := "sk-" + tokenKey
 
-	// 从 api-keys 列表中删除
-	if err := removeTokenFromAPIKeys(fullKey); err != nil {
-		common.SysLog(fmt.Sprintf("CLIProxy sync: failed to remove token from api-keys: %v", err))
+	// 1. 获取当前的 openai-compatibility 配置
+	currentConfig, err := getOpenAICompatConfig()
+	if err != nil {
+		common.SysLog(fmt.Sprintf("CLIProxy sync: failed to get openai-compatibility config: %v", err))
+		return err
+	}
+
+	// 2. 从 api-key-entries 中删除该 token
+	if err := removeTokenFromOpenAICompat(currentConfig, fullKey); err != nil {
+		common.SysLog(fmt.Sprintf("CLIProxy sync: failed to remove token from openai-compatibility: %v", err))
 		return err
 	}
 
@@ -143,18 +224,61 @@ func DeleteTokenFromCLIProxy(tokenKey string) error {
 	return nil
 }
 
-// removeTokenFromAPIKeys 从 CLIProxyAPIPlus 的 api-keys 列表中删除 token
-func removeTokenFromAPIKeys(tokenKey string) error {
-	// CLIProxyAPIPlus 的 deleteFromStringList 接受 ?value=xxx 参数
-	url := CLIProxyAPIManagementURL + CLIProxyAPIAPIKeysEndpoint +
-		"?value=" + strings.TrimSpace(tokenKey)
+// removeTokenFromOpenAICompat 从 openai-compatibility 配置的 api-key-entries 中删除 token
+func removeTokenFromOpenAICompat(currentConfig []map[string]interface{}, tokenKey string) error {
+	// 查找目标配置项的索引
+	targetIndex := -1
+	for i, cfg := range currentConfig {
+		if name, ok := cfg["name"].(string); ok && name == CliProxySyncConfigName {
+			targetIndex = i
+			break
+		}
+	}
 
-	req, err := http.NewRequest("DELETE", url, nil)
+	if targetIndex == -1 {
+		// 配置不存在，视为成功
+		return nil
+	}
+
+	// 获取当前的 api-key-entries
+	var currentEntries []map[string]interface{}
+	if entries, ok := currentConfig[targetIndex]["api-key-entries"].([]interface{}); ok {
+		for _, e := range entries {
+			if entry, ok := e.(map[string]interface{}); ok {
+				currentEntries = append(currentEntries, entry)
+			}
+		}
+	}
+
+	// 过滤掉要删除的 token
+	var newEntries []map[string]interface{}
+	for _, entry := range currentEntries {
+		if apiKey, ok := entry["api-key"].(string); ok && apiKey != tokenKey {
+			newEntries = append(newEntries, entry)
+		}
+	}
+
+	// 使用 PATCH 更新配置
+	url := CLIProxyAPIManagementURL + CLIProxyAPIOpenAICompatEndpoint
+
+	payload := map[string]interface{}{
+		"name": CliProxySyncConfigName,
+		"value": map[string]interface{}{
+			"api-key-entries": newEntries,
+		},
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	req, err := http.NewRequest("PATCH", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 
-	// 添加管理密钥认证（如果配置了）
 	if managementKey := getCLIProxyManagementKey(); managementKey != "" {
 		req.Header.Set("Authorization", "Bearer "+managementKey)
 	}
@@ -165,8 +289,7 @@ func removeTokenFromAPIKeys(tokenKey string) error {
 	}
 	defer resp.Body.Close()
 
-	// DELETE 可能返回 200 或 404（如果 key 不存在），都认为成功
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
