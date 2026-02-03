@@ -263,6 +263,14 @@ func Register(c *gin.Context) {
 			})
 			return
 		}
+
+		// 同步 token 到 CLIProxyAPIPlus
+		go func() {
+			syncErr := service.SyncTokenToCLIProxy(token.Key, token.Id, token.UserId, token.Name)
+			if syncErr != nil {
+				common.SysLog(fmt.Sprintf("failed to sync default token to CLIProxyAPI: %v", syncErr))
+			}
+		}()
 	}
 
 	c.JSON(http.StatusOK, gin.H{

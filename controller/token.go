@@ -8,6 +8,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
 )
@@ -197,6 +198,15 @@ func AddToken(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+
+	// 同步 token 到 CLIProxyAPIPlus
+	go func() {
+		syncErr := service.SyncTokenToCLIProxy(cleanToken.Key, cleanToken.Id, cleanToken.UserId, cleanToken.Name)
+		if syncErr != nil {
+			common.SysLog(fmt.Sprintf("failed to sync token to CLIProxyAPI: %v", syncErr))
+		}
+	}()
+
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -207,11 +217,29 @@ func AddToken(c *gin.Context) {
 func DeleteToken(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
 	userId := c.GetInt("id")
-	err := model.DeleteTokenById(id, userId)
+
+	// 获取 token key 用于从 CLIProxyAPI 删除
+	token, err := model.GetTokenByIds(id, userId)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
+	tokenKey := token.Key
+
+	err = model.DeleteTokenById(id, userId)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+
+	// 从 CLIProxyAPIPlus 删除 token
+	go func() {
+		syncErr := service.DeleteTokenFromCLIProxy(tokenKey)
+		if syncErr != nil {
+			common.SysLog(fmt.Sprintf("failed to delete token from CLIProxyAPI: %v", syncErr))
+		}
+	}()
+
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -313,11 +341,32 @@ func DeleteTokenBatch(c *gin.Context) {
 		return
 	}
 	userId := c.GetInt("id")
+
+	// 获取所有要删除的 token keys，用于从 CLIProxyAPI 删除
+	var tokenKeys []string
+	for _, id := range tokenBatch.Ids {
+		token, err := model.GetTokenByIds(id, userId)
+		if err == nil && token != nil {
+			tokenKeys = append(tokenKeys, token.Key)
+		}
+	}
+
 	count, err := model.BatchDeleteTokens(tokenBatch.Ids, userId)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
+
+	// 从 CLIProxyAPIPlus 批量删除 tokens
+	go func() {
+		for _, key := range tokenKeys {
+			syncErr := service.DeleteTokenFromCLIProxy(key)
+			if syncErr != nil {
+				common.SysLog(fmt.Sprintf("failed to delete token from CLIProxyAPI: %v", syncErr))
+			}
+		}
+	}()
+
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
