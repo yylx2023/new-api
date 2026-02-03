@@ -324,20 +324,28 @@ func WukongChatStream(c *gin.Context) {
 	completionTokens := streamResult.Usage.CompletionTokens
 
 	// 如果没有解析到 usage，则根据内容长度估算 token（中文约 0.6 token/char，英文约 0.25 token/char）
-	if promptTokens == 0 && completionTokens == 0 && len(streamResult.ResponseContent) > 0 {
-		// 估算：假设平均 0.4 token/char（中英文混合）
-		estimatedCompletionTokens := int(float64(len(streamResult.ResponseContent)) * 0.4)
-		if estimatedCompletionTokens < 1 {
+	if promptTokens == 0 && completionTokens == 0 {
+		var estimatedCompletionTokens int
+		if len(streamResult.ResponseContent) > 0 {
+			// 估算：假设平均 0.4 token/char（中英文混合）
+			estimatedCompletionTokens = int(float64(len(streamResult.ResponseContent)) * 0.4)
+		} else if streamResult.RawBytesCount > 0 {
+			// Fallback: 使用原始字节数估算（假设 JSON 包装占 50%）
+			estimatedCompletionTokens = int(float64(streamResult.RawBytesCount) * 0.2)
+		}
+		if estimatedCompletionTokens < 1 && streamResult.RawBytesCount > 100 {
 			estimatedCompletionTokens = 1
 		}
-		completionTokens = estimatedCompletionTokens
-		// 估算 prompt tokens（基于请求 body 大小）
-		promptTokens = int(float64(len(body)) * 0.3)
-		if promptTokens < 1 {
-			promptTokens = 1
+		if estimatedCompletionTokens > 0 {
+			completionTokens = estimatedCompletionTokens
+			// 估算 prompt tokens（基于请求 body 大小）
+			promptTokens = int(float64(len(body)) * 0.3)
+			if promptTokens < 1 {
+				promptTokens = 1
+			}
+			common.SysLog(fmt.Sprintf("Token 估算: prompt=%d, completion=%d (内容长度=%d, 原始字节=%d)",
+				promptTokens, completionTokens, len(streamResult.ResponseContent), streamResult.RawBytesCount))
 		}
-		common.SysLog(fmt.Sprintf("Token 估算: prompt=%d, completion=%d (基于内容长度 %d)",
-			promptTokens, completionTokens, len(streamResult.ResponseContent)))
 	}
 
 	totalTokens := promptTokens + completionTokens
@@ -403,6 +411,7 @@ func WukongChatStream(c *gin.Context) {
 type StreamResult struct {
 	Usage           dto.Usage
 	ResponseContent string // 累积的响应内容，用于估算 token
+	RawBytesCount   int    // 原始字节数，用于 fallback 估算
 }
 
 // streamAndParseUsage 流式传输响应并解析 usage 信息
@@ -415,6 +424,10 @@ func streamAndParseUsage(c *gin.Context, body io.Reader) StreamResult {
 
 	debugEnabled := common.GetEnvOrDefaultBool("WUKONG_DEBUG", false)
 
+	// 计数器
+	lineCount := 0
+	dataLineCount := 0
+
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -423,6 +436,7 @@ func streamAndParseUsage(c *gin.Context, body io.Reader) StreamResult {
 				if len(line) > 0 {
 					c.Writer.Write([]byte(line))
 					c.Writer.Flush()
+					result.RawBytesCount += len(line)
 					// 尝试解析
 					parseUsageFromLine(line, &result.Usage)
 					extractContentFromLine(line, &contentBuilder)
@@ -433,6 +447,9 @@ func streamAndParseUsage(c *gin.Context, body io.Reader) StreamResult {
 			break
 		}
 
+		lineCount++
+		result.RawBytesCount += len(line)
+
 		// 写入响应
 		c.Writer.Write([]byte(line))
 		c.Writer.Flush()
@@ -440,13 +457,18 @@ func streamAndParseUsage(c *gin.Context, body io.Reader) StreamResult {
 		// 去除行尾换行符进行解析
 		trimmedLine := strings.TrimRight(line, "\r\n")
 
-		// 调试日志
-		if debugEnabled && strings.HasPrefix(trimmedLine, "data:") {
-			common.SysLog("DEBUG SSE: " + trimmedLine[:min(200, len(trimmedLine))])
+		// 调试日志 - 记录所有非空行的前200字符
+		if debugEnabled && len(trimmedLine) > 0 {
+			logLine := trimmedLine
+			if len(logLine) > 200 {
+				logLine = logLine[:200] + "..."
+			}
+			common.SysLog(fmt.Sprintf("DEBUG SSE [%d]: %s", lineCount, logLine))
 		}
 
 		// 解析 SSE 数据
 		if strings.HasPrefix(trimmedLine, "data: ") {
+			dataLineCount++
 			data := strings.TrimPrefix(trimmedLine, "data: ")
 			if data == "[DONE]" {
 				continue
@@ -458,6 +480,7 @@ func streamAndParseUsage(c *gin.Context, body io.Reader) StreamResult {
 			extractContentFromData(data, &contentBuilder)
 		} else if strings.HasPrefix(trimmedLine, "data:") {
 			// 处理 "data:" 后直接跟数据的情况（无空格）
+			dataLineCount++
 			data := strings.TrimPrefix(trimmedLine, "data:")
 			if data != "[DONE]" && data != "" {
 				parseUsageFromData(data, &result.Usage)
@@ -466,14 +489,29 @@ func streamAndParseUsage(c *gin.Context, body io.Reader) StreamResult {
 		} else if strings.Contains(trimmedLine, `"usage"`) {
 			// 有些响应可能直接在行中包含 usage，不在 data: 前缀后
 			parseUsageFromData(trimmedLine, &result.Usage)
+		} else if len(trimmedLine) > 0 && !strings.HasPrefix(trimmedLine, ":") && !strings.HasPrefix(trimmedLine, "event:") {
+			// 非标准 SSE：可能是纯文本流或其他格式
+			// 尝试作为 JSON 解析
+			if strings.HasPrefix(trimmedLine, "{") {
+				parseUsageFromData(trimmedLine, &result.Usage)
+				extractContentFromData(trimmedLine, &contentBuilder)
+			} else {
+				// 可能是纯文本响应，直接累积
+				contentBuilder.WriteString(trimmedLine)
+			}
 		}
 	}
 
 	result.ResponseContent = contentBuilder.String()
 
 	// 记录解析结果用于调试
+	common.SysLog(fmt.Sprintf("SSE 解析完成: 总行数=%d, data行数=%d, 内容长度=%d, 原始字节=%d",
+		lineCount, dataLineCount, len(result.ResponseContent), result.RawBytesCount))
+
 	if result.Usage.PromptTokens == 0 && result.Usage.CompletionTokens == 0 {
-		common.SysLog(fmt.Sprintf("未解析到 usage 信息，响应内容长度: %d 字符", len(result.ResponseContent)))
+		if len(result.ResponseContent) == 0 && result.RawBytesCount > 0 {
+			common.SysLog("警告: 未能提取内容，将使用原始字节数估算")
+		}
 	} else {
 		common.SysLog(fmt.Sprintf("解析到 usage: prompt=%d, completion=%d, total=%d",
 			result.Usage.PromptTokens, result.Usage.CompletionTokens, result.Usage.TotalTokens))
@@ -483,20 +521,85 @@ func streamAndParseUsage(c *gin.Context, body io.Reader) StreamResult {
 }
 
 // extractContentFromData 从 SSE 数据中提取文本内容
+// 支持多种响应格式
 func extractContentFromData(data string, builder *strings.Builder) {
-	// 尝试解析 OpenAI 格式的 delta content
-	var streamResp struct {
+	// 格式 1: OpenAI 标准流式格式 - choices[].delta.content
+	var streamResp1 struct {
 		Choices []struct {
 			Delta struct {
 				Content string `json:"content"`
 			} `json:"delta"`
 		} `json:"choices"`
 	}
-	if err := json.Unmarshal([]byte(data), &streamResp); err == nil {
-		for _, choice := range streamResp.Choices {
+	if err := json.Unmarshal([]byte(data), &streamResp1); err == nil {
+		for _, choice := range streamResp1.Choices {
 			if choice.Delta.Content != "" {
 				builder.WriteString(choice.Delta.Content)
+				return
 			}
+		}
+	}
+
+	// 格式 2: 非流式格式 - choices[].message.content
+	var streamResp2 struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(data), &streamResp2); err == nil {
+		for _, choice := range streamResp2.Choices {
+			if choice.Message.Content != "" {
+				builder.WriteString(choice.Message.Content)
+				return
+			}
+		}
+	}
+
+	// 格式 3: 直接 content 字段
+	var streamResp3 struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(data), &streamResp3); err == nil {
+		if streamResp3.Content != "" {
+			builder.WriteString(streamResp3.Content)
+			return
+		}
+	}
+
+	// 格式 4: text 字段
+	var streamResp4 struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(data), &streamResp4); err == nil {
+		if streamResp4.Text != "" {
+			builder.WriteString(streamResp4.Text)
+			return
+		}
+	}
+
+	// 格式 5: response 字段
+	var streamResp5 struct {
+		Response string `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(data), &streamResp5); err == nil {
+		if streamResp5.Response != "" {
+			builder.WriteString(streamResp5.Response)
+			return
+		}
+	}
+
+	// 格式 6: data.content 嵌套格式
+	var streamResp6 struct {
+		Data struct {
+			Content string `json:"content"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(data), &streamResp6); err == nil {
+		if streamResp6.Data.Content != "" {
+			builder.WriteString(streamResp6.Data.Content)
+			return
 		}
 	}
 }
