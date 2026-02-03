@@ -316,12 +316,30 @@ func WukongChatStream(c *gin.Context) {
 	}
 
 	// 流式传输响应并解析 usage
-	usage := streamAndParseUsage(c, resp.Body)
+	streamResult := streamAndParseUsage(c, resp.Body)
 
 	// 计算实际消耗
 	useTimeSeconds := int(time.Since(startTime).Seconds())
-	promptTokens := usage.PromptTokens
-	completionTokens := usage.CompletionTokens
+	promptTokens := streamResult.Usage.PromptTokens
+	completionTokens := streamResult.Usage.CompletionTokens
+
+	// 如果没有解析到 usage，则根据内容长度估算 token（中文约 0.6 token/char，英文约 0.25 token/char）
+	if promptTokens == 0 && completionTokens == 0 && len(streamResult.ResponseContent) > 0 {
+		// 估算：假设平均 0.4 token/char（中英文混合）
+		estimatedCompletionTokens := int(float64(len(streamResult.ResponseContent)) * 0.4)
+		if estimatedCompletionTokens < 1 {
+			estimatedCompletionTokens = 1
+		}
+		completionTokens = estimatedCompletionTokens
+		// 估算 prompt tokens（基于请求 body 大小）
+		promptTokens = int(float64(len(body)) * 0.3)
+		if promptTokens < 1 {
+			promptTokens = 1
+		}
+		common.SysLog(fmt.Sprintf("Token 估算: prompt=%d, completion=%d (基于内容长度 %d)",
+			promptTokens, completionTokens, len(streamResult.ResponseContent)))
+	}
+
 	totalTokens := promptTokens + completionTokens
 
 	var actualQuota int
@@ -381,11 +399,21 @@ func WukongChatStream(c *gin.Context) {
 	}
 }
 
+// StreamResult 包含流式传输的结果
+type StreamResult struct {
+	Usage           dto.Usage
+	ResponseContent string // 累积的响应内容，用于估算 token
+}
+
 // streamAndParseUsage 流式传输响应并解析 usage 信息
 // 支持多种 SSE 格式和非标准 usage 位置
-func streamAndParseUsage(c *gin.Context, body io.Reader) dto.Usage {
-	var usage dto.Usage
+// 同时累积响应内容用于 token 估算（当无 usage 信息时）
+func streamAndParseUsage(c *gin.Context, body io.Reader) StreamResult {
+	var result StreamResult
+	var contentBuilder strings.Builder
 	reader := bufio.NewReader(body)
+
+	debugEnabled := common.GetEnvOrDefaultBool("WUKONG_DEBUG", false)
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -396,7 +424,8 @@ func streamAndParseUsage(c *gin.Context, body io.Reader) dto.Usage {
 					c.Writer.Write([]byte(line))
 					c.Writer.Flush()
 					// 尝试解析
-					parseUsageFromLine(line, &usage)
+					parseUsageFromLine(line, &result.Usage)
+					extractContentFromLine(line, &contentBuilder)
 				}
 				break
 			}
@@ -411,6 +440,11 @@ func streamAndParseUsage(c *gin.Context, body io.Reader) dto.Usage {
 		// 去除行尾换行符进行解析
 		trimmedLine := strings.TrimRight(line, "\r\n")
 
+		// 调试日志
+		if debugEnabled && strings.HasPrefix(trimmedLine, "data:") {
+			common.SysLog("DEBUG SSE: " + trimmedLine[:min(200, len(trimmedLine))])
+		}
+
 		// 解析 SSE 数据
 		if strings.HasPrefix(trimmedLine, "data: ") {
 			data := strings.TrimPrefix(trimmedLine, "data: ")
@@ -419,28 +453,68 @@ func streamAndParseUsage(c *gin.Context, body io.Reader) dto.Usage {
 			}
 
 			// 尝试解析 usage
-			parseUsageFromData(data, &usage)
+			parseUsageFromData(data, &result.Usage)
+			// 提取内容用于 token 估算
+			extractContentFromData(data, &contentBuilder)
 		} else if strings.HasPrefix(trimmedLine, "data:") {
 			// 处理 "data:" 后直接跟数据的情况（无空格）
 			data := strings.TrimPrefix(trimmedLine, "data:")
 			if data != "[DONE]" && data != "" {
-				parseUsageFromData(data, &usage)
+				parseUsageFromData(data, &result.Usage)
+				extractContentFromData(data, &contentBuilder)
 			}
 		} else if strings.Contains(trimmedLine, `"usage"`) {
 			// 有些响应可能直接在行中包含 usage，不在 data: 前缀后
-			parseUsageFromData(trimmedLine, &usage)
+			parseUsageFromData(trimmedLine, &result.Usage)
 		}
 	}
 
+	result.ResponseContent = contentBuilder.String()
+
 	// 记录解析结果用于调试
-	if usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
-		common.SysLog("警告: 未能从响应中解析到 usage 信息")
+	if result.Usage.PromptTokens == 0 && result.Usage.CompletionTokens == 0 {
+		common.SysLog(fmt.Sprintf("未解析到 usage 信息，响应内容长度: %d 字符", len(result.ResponseContent)))
 	} else {
 		common.SysLog(fmt.Sprintf("解析到 usage: prompt=%d, completion=%d, total=%d",
-			usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens))
+			result.Usage.PromptTokens, result.Usage.CompletionTokens, result.Usage.TotalTokens))
 	}
 
-	return usage
+	return result
+}
+
+// extractContentFromData 从 SSE 数据中提取文本内容
+func extractContentFromData(data string, builder *strings.Builder) {
+	// 尝试解析 OpenAI 格式的 delta content
+	var streamResp struct {
+		Choices []struct {
+			Delta struct {
+				Content string `json:"content"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(data), &streamResp); err == nil {
+		for _, choice := range streamResp.Choices {
+			if choice.Delta.Content != "" {
+				builder.WriteString(choice.Delta.Content)
+			}
+		}
+	}
+}
+
+// extractContentFromLine 从行中提取内容
+func extractContentFromLine(line string, builder *strings.Builder) {
+	start := strings.Index(line, "{")
+	if start != -1 {
+		extractContentFromData(line[start:], builder)
+	}
+}
+
+// min 返回两个整数中较小的一个
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // parseUsageFromData 从 JSON 数据中解析 usage
